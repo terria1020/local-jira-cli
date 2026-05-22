@@ -1,0 +1,25 @@
+{
+  "name": "local-jira-cli",
+  "version": "0.1.0",
+  "description": "Thin Jira wrapper CLI over Atlassian ACLI for safe AI usage",
+  "main": "local-jira-cli.js",
+  "bin": {
+    "local-jira-cli": "./local-jira-cli.js"
+  },
+  "scripts": {
+    "help": "node local-jira-cli.js --help"
+  },
+  "keywords": [
+    "jira",
+    "acli",
+    "cli",
+    "wrapper"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1"
+  }
+}
