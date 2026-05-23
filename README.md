@@ -86,6 +86,9 @@ cp .env.example .env
 
 - `ACLI_PATH` (선택): 기본 `acli`. PATH 외 위치라면 절대 경로를 지정
 - `JIRA_DEFAULT_PROJECT` (선택): `ticket-list`에서 `--jql` 생략 시 사용
+- `JIRA_SITE` 또는 `JIRA_BASE_URL` (선택): `transition-list` REST 조회에 사용
+- `JIRA_EMAIL` (선택): `transition-list` REST 조회에 사용
+- `JIRA_API_TOKEN_FILE` 또는 `JIRA_API_TOKEN` (선택): `transition-list` REST 조회에 사용. 파일 방식 권장
 
 ## 5. 사용법
 
@@ -93,7 +96,7 @@ cp .env.example .env
 node local-jira-cli.js --help
 ```
 
-지원 명령(allowlist) — 모두 실호출 검증 완료:
+지원 명령(allowlist):
 
 | 래퍼 명령 | acli | 종류 |
 |---|---|---|
@@ -101,9 +104,14 @@ node local-jira-cli.js --help
 | `ticket-list` | `jira workitem search` | 조회 |
 | `ticket-show` | `jira workitem view <KEY>` | 조회 |
 | `comment-list` | `jira workitem comment list` | 조회 |
+| `ticket-context` | `workitem view` + `comment list` | 조회 조합 |
+| `ticket-tree` | `workitem view` + `workitem search parent = ...` | 조회 조합 |
+| `transition-list` | Jira REST `/transitions` | 조회 |
 | `comment-add` | `jira workitem comment create` | 쓰기 (`--yes` 필수) |
 | `comment-delete` | `jira workitem comment delete` | 쓰기 (`--yes` 필수) |
 | `transition` | `jira workitem transition` | 쓰기 (`--yes` 필수) |
+| `project-overview` | `board search` + `workitem search` + `board list-sprints` | 조회 조합 |
+| `ticket-update` | `jira workitem edit` | 쓰기 (`--yes` 필수) |
 
 쓰기 명령은 `--yes` 또는 `--dry-run` 없으면 래퍼 차원에서 `CONFIRMATION_REQUIRED`로 차단됩니다.
 
@@ -125,6 +133,18 @@ node local-jira-cli.js ticket-list --jql "assignee = currentUser() AND statusCat
 # 티켓 상세
 node local-jira-cli.js ticket-show --key TEAM-123
 
+# 티켓 컨텍스트 (상세 + 부모/하위작업 + 링크 + 최근 댓글)
+node local-jira-cli.js ticket-context --key TEAM-123 --comments 10
+
+# 티켓 트리 (부모/자식 관계 탐색)
+node local-jira-cli.js ticket-tree --key TEAM-123 --depth 2 --limit 50
+
+# 프로젝트 오버뷰 (보드 + 활성/예정 스프린트 + 최근 티켓)
+node local-jira-cli.js project-overview --project TEAM --limit 20 --board-limit 5
+
+# 가능한 상태 전이 후보 조회 (JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN_FILE 필요)
+node local-jira-cli.js transition-list --key TEAM-123
+
 # 댓글 목록
 node local-jira-cli.js comment-list --key TEAM-123 --limit 20
 
@@ -136,6 +156,9 @@ node local-jira-cli.js comment-delete --key TEAM-123 --id 79216 --yes
 
 # 상태 전이
 node local-jira-cli.js transition --key TEAM-123 --status "진행 중" --yes
+
+# 티켓 수정 (본문은 파일 기반 권장)
+node local-jira-cli.js ticket-update --key TEAM-123 --description-file ./description.md --yes
 ```
 
 ## 실험 범위 (PoC)

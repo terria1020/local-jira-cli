@@ -2,6 +2,7 @@
 "use strict";
 
 const fs = require("fs");
+const https = require("https");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
@@ -98,6 +99,21 @@ const COMMANDS = {
       id: "--id"
     }
   },
+  "ticket-context": {
+    handler: runTicketContext,
+    write: false,
+    required: ["key"]
+  },
+  "ticket-tree": {
+    handler: runTicketTree,
+    write: false,
+    required: ["key"]
+  },
+  "transition-list": {
+    handler: runTransitionList,
+    write: false,
+    required: ["key"]
+  },
   transition: {
     acli: ["jira", "workitem", "transition"],
     write: true,
@@ -107,6 +123,47 @@ const COMMANDS = {
     flags: {
       key: "--key",
       status: "--status"
+    }
+  },
+  "project-overview": {
+    handler: runProjectOverview,
+    write: false,
+    synthesize(args) {
+      if (!args.project) {
+        const project = process.env.JIRA_DEFAULT_PROJECT;
+        if (!project) return "project-overview requires --project or JIRA_DEFAULT_PROJECT";
+        args.project = project;
+      }
+      return null;
+    }
+  },
+  "ticket-update": {
+    acli: ["jira", "workitem", "edit"],
+    write: true,
+    supportsJson: true,
+    supportsAcliYes: true,
+    required: ["key"],
+    flags: {
+      key: "--key",
+      summary: "--summary",
+      "description-file": "--description-file",
+      labels: "--labels",
+      "remove-labels": "--remove-labels",
+      assignee: "--assignee",
+      "remove-assignee": { flag: "--remove-assignee", boolean: true }
+    },
+    validate(args) {
+      const editable = ["summary", "description-file", "labels", "remove-labels", "assignee", "remove-assignee"];
+      if (!editable.some((key) => args[key] !== undefined)) {
+        return "ticket-update requires one of --summary, --description-file, --labels, --remove-labels, --assignee, --remove-assignee";
+      }
+      if (args["description-file"] !== undefined) {
+        if (args["description-file"] === true) return "ticket-update requires a file path for --description-file";
+        const descriptionPath = path.resolve(process.cwd(), expandHome(String(args["description-file"])));
+        if (!fs.existsSync(descriptionPath)) return `description file does not exist: ${descriptionPath}`;
+        if (!fs.statSync(descriptionPath).isFile()) return `description path is not a file: ${descriptionPath}`;
+      }
+      return null;
     }
   }
 };
@@ -118,7 +175,8 @@ function printHelp() {
     usage: [
       "local-jira-cli --help",
       "local-jira-cli <command> [options]",
-      "local-jira-cli ticket-list --jql \"project = TEAM ORDER BY created DESC\" --limit 20"
+      "local-jira-cli ticket-list --jql \"project = TEAM ORDER BY created DESC\" --limit 20",
+      "local-jira-cli ticket-context --key TEAM-123 --comments 10"
     ],
     commands: Object.keys(COMMANDS),
     commonOptions: [
@@ -165,7 +223,7 @@ function resolveAcliBinary() {
   return process.env.ACLI_PATH || "acli";
 }
 
-function buildAcliArgs(name, spec, args) {
+function validateSpec(name, spec, args) {
   if (typeof spec.synthesize === "function") {
     const err = spec.synthesize(args);
     if (err) fail("VALIDATION_ERROR", err);
@@ -185,6 +243,10 @@ function buildAcliArgs(name, spec, args) {
   if (spec.write && !args.yes && !args["dry-run"]) {
     fail("CONFIRMATION_REQUIRED", `${name} is a write command — pass --yes (or use --dry-run)`);
   }
+}
+
+function buildAcliArgs(name, spec, args) {
+  validateSpec(name, spec, args);
 
   const out = [...spec.acli];
 
@@ -193,10 +255,19 @@ function buildAcliArgs(name, spec, args) {
   }
 
   const positionalSet = new Set(spec.positional || []);
-  for (const [argKey, flag] of Object.entries(spec.flags || {})) {
+  for (const [argKey, flagSpec] of Object.entries(spec.flags || {})) {
     if (positionalSet.has(argKey)) continue;
     const v = args[argKey];
-    if (v === undefined || v === true) continue;
+    if (v === undefined) continue;
+
+    const flag = typeof flagSpec === "string" ? flagSpec : flagSpec.flag;
+    const isBoolean = typeof flagSpec === "object" && flagSpec.boolean;
+    if (isBoolean) {
+      if (v === true) out.push(flag);
+      continue;
+    }
+
+    if (v === true) continue;
     out.push(flag, String(v));
   }
 
@@ -206,7 +277,440 @@ function buildAcliArgs(name, spec, args) {
   return out;
 }
 
-function main() {
+function executeAcli(acli, acliArgs, spec, options = {}) {
+  const handleFailure = (code, message, details) => {
+    if (options.throwOnError) {
+      const err = new Error(message);
+      err.code = code;
+      err.details = details;
+      throw err;
+    }
+    fail(code, message, details);
+  };
+
+  const result = spawnSync(acli, acliArgs, { encoding: "utf8" });
+
+  if (result.error) {
+    handleFailure("EXEC_ERROR", "Failed to execute ACLI", { message: result.error.message, command: [acli, ...acliArgs] });
+  }
+
+  if (result.status !== 0) {
+    handleFailure("ACLI_ERROR", "ACLI returned non-zero exit status", {
+      exitCode: result.status,
+      stderr: (result.stderr || "").trim(),
+      command: [acli, ...acliArgs]
+    });
+  }
+
+  const stdout = (result.stdout || "").trim();
+
+  if (!spec.supportsJson) {
+    return { stdout };
+  }
+
+  if (!stdout) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    handleFailure("PARSE_ERROR", "ACLI output is not valid JSON", { raw: stdout.slice(0, 1000) });
+  }
+}
+
+function runAcliJson(acli, acliArgs) {
+  return executeAcli(acli, acliArgs, { supportsJson: true });
+}
+
+function tryRunAcliJson(acli, acliArgs) {
+  return executeAcli(acli, acliArgs, { supportsJson: true }, { throwOnError: true });
+}
+
+function asInt(value, fallback) {
+  if (value === undefined || value === true) return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function compactUser(user) {
+  if (!user) return null;
+  if (typeof user === "string") return { displayName: user };
+  return {
+    accountId: user.accountId || null,
+    displayName: user.displayName || user.name || null,
+    emailAddress: user.emailAddress || null
+  };
+}
+
+function compactNamed(value) {
+  if (!value) return null;
+  if (typeof value === "string") return { name: value };
+  return {
+    id: value.id || null,
+    key: value.key || null,
+    name: value.name || value.value || null
+  };
+}
+
+function adfToText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  const parts = [];
+
+  function visit(node) {
+    if (!node) return;
+    if (typeof node === "string") {
+      parts.push(node);
+      return;
+    }
+    if (node.text) parts.push(node.text);
+    if (Array.isArray(node.content)) node.content.forEach(visit);
+    if (["paragraph", "heading", "blockquote", "listItem"].includes(node.type)) parts.push("\n");
+    if (node.type === "hardBreak") parts.push("\n");
+  }
+
+  visit(value);
+  return parts.join("").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeIssue(issue) {
+  if (!issue) return null;
+  const fields = issue.fields || {};
+  return {
+    id: issue.id || null,
+    key: issue.key || null,
+    summary: fields.summary || null,
+    issueType: compactNamed(fields.issuetype),
+    status: compactNamed(fields.status),
+    statusCategory: compactNamed(fields.status && fields.status.statusCategory),
+    assignee: compactUser(fields.assignee),
+    reporter: compactUser(fields.reporter),
+    priority: compactNamed(fields.priority),
+    labels: fields.labels || [],
+    project: compactNamed(fields.project),
+    created: fields.created || null,
+    updated: fields.updated || null,
+    descriptionText: adfToText(fields.description),
+    self: issue.self || null
+  };
+}
+
+function normalizeIssueRef(issue) {
+  if (!issue) return null;
+  const fields = issue.fields || {};
+  return {
+    id: issue.id || null,
+    key: issue.key || null,
+    summary: fields.summary || issue.summary || null,
+    issueType: compactNamed(fields.issuetype || issue.issuetype),
+    status: compactNamed(fields.status || issue.status),
+    priority: compactNamed(fields.priority || issue.priority),
+    self: issue.self || null
+  };
+}
+
+function normalizeComments(payload) {
+  const comments = payload && (payload.comments || payload.result && payload.result.comments);
+  if (!Array.isArray(comments)) return [];
+  return comments.map((comment) => ({
+    id: comment.id || null,
+    author: compactUser(comment.author),
+    created: comment.created || null,
+    updated: comment.updated || null,
+    visibility: comment.visibility || (comment.jsdPublic === true ? "public" : null),
+    bodyText: adfToText(comment.body)
+  }));
+}
+
+function normalizeLinks(links) {
+  if (!Array.isArray(links)) return [];
+  return links.map((link) => ({
+    id: link.id || null,
+    type: link.type && (link.type.name || link.type.inward || link.type.outward) || null,
+    inwardIssue: normalizeIssueRef(link.inwardIssue),
+    outwardIssue: normalizeIssueRef(link.outwardIssue)
+  }));
+}
+
+function viewIssue(acli, key, fields) {
+  return runAcliJson(acli, ["jira", "workitem", "view", key, "--fields", fields, "--json"]);
+}
+
+function searchIssues(acli, jql, limit, fields) {
+  return runAcliJson(acli, [
+    "jira",
+    "workitem",
+    "search",
+    "--jql",
+    jql,
+    "--limit",
+    String(limit),
+    "--fields",
+    fields,
+    "--json"
+  ]);
+}
+
+function printOk(result) {
+  process.stdout.write(`${JSON.stringify({ ok: true, result }, null, 2)}\n`);
+}
+
+function printDryRun(steps) {
+  process.stdout.write(`${JSON.stringify({ ok: true, dryRun: true, steps }, null, 2)}\n`);
+}
+
+function runTicketContext(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const key = String(args.key);
+  const commentLimit = asInt(args.comments, 10);
+  const fields = "summary,status,assignee,reporter,description,labels,priority,parent,subtasks,issuelinks,created,updated,project,issuetype";
+  const steps = [
+    [acli, "jira", "workitem", "view", key, "--fields", fields, "--json"]
+  ];
+  if (commentLimit > 0) {
+    steps.push([acli, "jira", "workitem", "comment", "list", "--key", key, "--limit", String(commentLimit), "--json"]);
+  }
+  if (args["dry-run"]) return printDryRun(steps);
+
+  const issue = viewIssue(acli, key, fields);
+  const comments = commentLimit > 0
+    ? runAcliJson(acli, ["jira", "workitem", "comment", "list", "--key", key, "--limit", String(commentLimit), "--json"])
+    : { comments: [] };
+  const issueFields = issue.fields || {};
+
+  return printOk({
+    issue: normalizeIssue(issue),
+    parent: normalizeIssueRef(issueFields.parent),
+    subtasks: Array.isArray(issueFields.subtasks) ? issueFields.subtasks.map(normalizeIssueRef) : [],
+    links: normalizeLinks(issueFields.issuelinks),
+    comments: normalizeComments(comments),
+    commentTotal: comments.total || normalizeComments(comments).length
+  });
+}
+
+function buildIssueTree(acli, key, depth, limit, warnings, seen) {
+  if (seen.has(key)) return { key, cycle: true };
+  seen.add(key);
+
+  const fields = "summary,status,assignee,priority,parent,subtasks,issuetype";
+  const issue = viewIssue(acli, key, fields);
+  const issueFields = issue.fields || {};
+
+  if (depth <= 0) {
+    return {
+      issue: normalizeIssue(issue),
+      parent: normalizeIssueRef(issueFields.parent),
+      children: []
+    };
+  }
+
+  const staticSubtasks = Array.isArray(issueFields.subtasks) ? issueFields.subtasks : [];
+  let jqlChildren = [];
+
+  try {
+    const searchResult = tryRunAcliJson(acli, [
+      "jira",
+      "workitem",
+      "search",
+      "--jql",
+      `parent = ${key} ORDER BY created ASC`,
+      "--limit",
+      String(limit),
+      "--fields",
+      "key,issuetype,summary,status,assignee,priority",
+      "--json"
+    ]);
+    jqlChildren = Array.isArray(searchResult) ? searchResult : [];
+  } catch (e) {
+    warnings.push(`child search failed for ${key}`);
+  }
+
+  const byKey = new Map();
+  for (const child of [...staticSubtasks, ...jqlChildren]) {
+    if (child && child.key) byKey.set(child.key, child);
+  }
+
+  const children = [];
+  for (const child of byKey.values()) {
+    children.push(buildIssueTree(acli, child.key, depth - 1, limit, warnings, new Set(seen)));
+  }
+
+  return {
+    issue: normalizeIssue(issue),
+    parent: normalizeIssueRef(issueFields.parent),
+    children
+  };
+}
+
+function runTicketTree(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const key = String(args.key);
+  const depth = asInt(args.depth, 2);
+  const limit = asInt(args.limit, 50);
+  if (args["dry-run"]) {
+    return printDryRun([
+      [acli, "jira", "workitem", "view", key, "--fields", "summary,status,assignee,priority,parent,subtasks,issuetype", "--json"],
+      [acli, "jira", "workitem", "search", "--jql", `parent = ${key} ORDER BY created ASC`, "--limit", String(limit), "--fields", "key,issuetype,summary,status,assignee,priority", "--json"]
+    ]);
+  }
+
+  const warnings = [];
+  return printOk({
+    root: buildIssueTree(acli, key, depth, limit, warnings, new Set()),
+    warnings
+  });
+}
+
+function runProjectOverview(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const project = String(args.project);
+  const limit = asInt(args.limit, 20);
+  const boardLimit = asInt(args["board-limit"], 5);
+  const sprintLimit = asInt(args["sprint-limit"], 5);
+  const issueFields = "key,issuetype,summary,status,assignee,priority";
+  const steps = [
+    [acli, "jira", "board", "search", "--project", project, "--limit", String(boardLimit), "--json"],
+    [acli, "jira", "workitem", "search", "--jql", `project = ${project} ORDER BY updated DESC`, "--limit", String(limit), "--fields", issueFields, "--json"]
+  ];
+  if (args["dry-run"]) return printDryRun(steps);
+
+  const warnings = [];
+  const boards = runAcliJson(acli, ["jira", "board", "search", "--project", project, "--limit", String(boardLimit), "--json"]);
+  const issues = searchIssues(acli, `project = ${project} ORDER BY updated DESC`, limit, issueFields);
+  const boardValues = boards && Array.isArray(boards.values) ? boards.values : [];
+  const sprintsByBoard = {};
+
+  for (const board of boardValues) {
+    if (!board.id || board.type !== "scrum") continue;
+    try {
+      sprintsByBoard[board.id] = tryRunAcliJson(acli, [
+        "jira",
+        "board",
+        "list-sprints",
+        "--id",
+        String(board.id),
+        "--state",
+        "active,future",
+        "--limit",
+        String(sprintLimit),
+        "--json"
+      ]);
+    } catch (e) {
+      warnings.push(`sprint list failed for board ${board.id}`);
+    }
+  }
+
+  const normalizedIssues = Array.isArray(issues) ? issues.map(normalizeIssue) : [];
+  const statusCounts = {};
+  for (const issue of normalizedIssues) {
+    const status = issue.status && issue.status.name || "Unknown";
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+  }
+
+  return printOk({
+    project,
+    boards,
+    sprintsByBoard,
+    recentIssues: normalizedIssues,
+    recentIssueStatusCounts: statusCounts,
+    warnings
+  });
+}
+
+function normalizeSite(site) {
+  if (!site) return null;
+  const value = String(site).trim();
+  if (!value) return null;
+  if (value.startsWith("http://") || value.startsWith("https://")) return value.replace(/\/+$/, "");
+  return `https://${value.replace(/\/+$/, "")}`;
+}
+
+function expandHome(filePath) {
+  if (!filePath) return filePath;
+  const value = String(filePath);
+  if (value === "~") return process.env.HOME;
+  if (value.startsWith("~/")) return path.join(process.env.HOME || "", value.slice(2));
+  return value;
+}
+
+function readToken(args) {
+  if (process.env.JIRA_API_TOKEN) return process.env.JIRA_API_TOKEN;
+  const tokenFile = args["token-file"] || process.env.JIRA_API_TOKEN_FILE;
+  if (!tokenFile) return null;
+  const resolved = path.resolve(process.cwd(), expandHome(tokenFile));
+  if (!fs.existsSync(resolved)) {
+    fail("CONFIG_REQUIRED", `Jira API token file does not exist: ${resolved}`);
+  }
+  return fs.readFileSync(resolved, "utf8").trim();
+}
+
+function jiraRestGet(pathname, args) {
+  const baseUrl = normalizeSite(args.site || process.env.JIRA_BASE_URL || process.env.JIRA_SITE);
+  const email = args.email || process.env.JIRA_EMAIL;
+  const token = readToken(args);
+  if (!baseUrl || !email || !token) {
+    fail("CONFIG_REQUIRED", "transition-list requires JIRA_BASE_URL/JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN or JIRA_API_TOKEN_FILE for Jira REST access");
+  }
+
+  const url = new URL(pathname, baseUrl);
+  const auth = Buffer.from(`${email}:${token}`).toString("base64");
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Basic ${auth}`
+      }
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`Jira REST returned ${res.statusCode}: ${body.slice(0, 1000)}`));
+          return;
+        }
+        try {
+          resolve(body ? JSON.parse(body) : null);
+        } catch (e) {
+          reject(new Error(`Jira REST output is not valid JSON: ${body.slice(0, 1000)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function runTransitionList(name, spec, args) {
+  validateSpec(name, spec, args);
+  const key = String(args.key);
+  const restPath = `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`;
+  if (args["dry-run"]) {
+    return printDryRun([["GET", restPath]]);
+  }
+
+  try {
+    const payload = await jiraRestGet(restPath, args);
+    return printOk({
+      key,
+      transitions: (payload.transitions || []).map((transition) => ({
+        id: transition.id,
+        name: transition.name,
+        to: compactNamed(transition.to),
+        hasScreen: transition.hasScreen || false,
+        isGlobal: transition.isGlobal || false,
+        isInitial: transition.isInitial || false
+      }))
+    });
+  } catch (e) {
+    fail("REST_ERROR", "Failed to fetch Jira transitions", { message: e.message });
+  }
+}
+
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const [command] = args._;
 
@@ -221,6 +725,12 @@ function main() {
   }
 
   const acli = resolveAcliBinary();
+
+  if (typeof spec.handler === "function") {
+    await spec.handler(command, spec, args, acli);
+    return;
+  }
+
   const acliArgs = buildAcliArgs(command, spec, args);
 
   if (args["dry-run"]) {
@@ -228,38 +738,9 @@ function main() {
     return;
   }
 
-  const result = spawnSync(acli, acliArgs, { encoding: "utf8" });
-
-  if (result.error) {
-    fail("EXEC_ERROR", "Failed to execute ACLI", { message: result.error.message, command: [acli, ...acliArgs] });
-  }
-
-  if (result.status !== 0) {
-    fail("ACLI_ERROR", "ACLI returned non-zero exit status", {
-      exitCode: result.status,
-      stderr: (result.stderr || "").trim(),
-      command: [acli, ...acliArgs]
-    });
-  }
-
-  const stdout = (result.stdout || "").trim();
-
-  if (!spec.supportsJson) {
-    process.stdout.write(`${JSON.stringify({ ok: true, result: { stdout } }, null, 2)}\n`);
-    return;
-  }
-
-  if (!stdout) {
-    process.stdout.write(`${JSON.stringify({ ok: true, result: null }, null, 2)}\n`);
-    return;
-  }
-
-  try {
-    const parsed = JSON.parse(stdout);
-    process.stdout.write(`${JSON.stringify({ ok: true, result: parsed }, null, 2)}\n`);
-  } catch (e) {
-    fail("PARSE_ERROR", "ACLI output is not valid JSON", { raw: stdout.slice(0, 1000) });
-  }
+  printOk(executeAcli(acli, acliArgs, spec));
 }
 
-main();
+main().catch((e) => {
+  fail("UNEXPECTED_ERROR", "Unexpected failure", { message: e.message });
+});
