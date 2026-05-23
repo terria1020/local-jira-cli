@@ -5,9 +5,9 @@ Atlassian `acli`를 안전하게 감싸는 최소 래퍼 CLI PoC입니다.
 목적:
 - AI가 임의 명령을 실행하지 못하도록 명령을 allowlist로 제한
 - `.env`를 CLI 프로세스 내부에서만 로드해 토큰/설정 노출 경계 분리
-- 출력 형식을 JSON으로 강제해 후처리 안정성 확보
+- 출력 형식을 JSON으로 강제해 후처리 안정성 확보 (단, acli가 `--json`을 지원하지 않는 명령은 stdout 텍스트를 그대로 감싸 반환)
 
-> ⚠️ **PoC 상태 알림**: 현재 ACLI 실제 호출 시 일부 명령은 acli 1.3.x 스펙과 맞지 않아 동작하지 않습니다 (`board-list`의 `--json` 미지원, `ticket-show`의 `--key` 미지원 등). 동작 검증된 명령: `ticket-list`, `comment-list`. 나머지는 매핑 수정 필요.
+대상 acli 버전: **1.3.18-stable** (2026-05 기준 실호출 검증 완료)
 
 ---
 
@@ -93,14 +93,19 @@ cp .env.example .env
 node local-jira-cli.js --help
 ```
 
-지원 명령(allowlist):
-- `board-list` — ⚠️ 현재 acli 매핑 깨짐 (수정 예정)
-- `ticket-list` — ✅ 동작 확인
-- `ticket-show` — ⚠️ acli `--key` 미지원, 위치 인자로 변경 필요
-- `comment-list` — ✅ 동작 확인
-- `comment-add` — 미검증 (쓰기, `--yes` 필수)
-- `comment-delete` — 미검증 (쓰기, `--yes` 필수)
-- `transition` — 미검증 (쓰기, `--yes` 필수)
+지원 명령(allowlist) — 모두 실호출 검증 완료:
+
+| 래퍼 명령 | acli | 종류 |
+|---|---|---|
+| `board-list` | `jira board search` | 조회 |
+| `ticket-list` | `jira workitem search` | 조회 |
+| `ticket-show` | `jira workitem view <KEY>` | 조회 |
+| `comment-list` | `jira workitem comment list` | 조회 |
+| `comment-add` | `jira workitem comment create` | 쓰기 (`--yes` 필수) |
+| `comment-delete` | `jira workitem comment delete` | 쓰기 (`--yes` 필수) |
+| `transition` | `jira workitem transition` | 쓰기 (`--yes` 필수) |
+
+쓰기 명령은 `--yes` 또는 `--dry-run` 없으면 래퍼 차원에서 `CONFIRMATION_REQUIRED`로 차단됩니다.
 
 예시:
 
@@ -108,11 +113,17 @@ node local-jira-cli.js --help
 # 실제 실행 없이 ACLI 명령 확인
 node local-jira-cli.js ticket-list --project TEAM --limit 20 --dry-run
 
+# 보드 목록 (프로젝트 필터)
+node local-jira-cli.js board-list --project TEAM
+
 # 티켓 목록 (프로젝트 기본 정렬: updated DESC)
 node local-jira-cli.js ticket-list --project TEAM --limit 20
 
 # 임의 JQL
 node local-jira-cli.js ticket-list --jql "assignee = currentUser() AND statusCategory != Done"
+
+# 티켓 상세
+node local-jira-cli.js ticket-show --key TEAM-123
 
 # 댓글 목록
 node local-jira-cli.js comment-list --key TEAM-123 --limit 20
@@ -120,8 +131,11 @@ node local-jira-cli.js comment-list --key TEAM-123 --limit 20
 # 댓글 추가 (쓰기 명령은 --yes 필수)
 node local-jira-cli.js comment-add --key TEAM-123 --body "작업 시작" --yes
 
+# 댓글 삭제
+node local-jira-cli.js comment-delete --key TEAM-123 --id 79216 --yes
+
 # 상태 전이
-node local-jira-cli.js transition --key TEAM-123 --status "In Progress" --yes
+node local-jira-cli.js transition --key TEAM-123 --status "진행 중" --yes
 ```
 
 ## 실험 범위 (PoC)

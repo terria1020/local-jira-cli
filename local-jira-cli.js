@@ -10,14 +10,105 @@ if (fs.existsSync(envPath)) {
   require("dotenv").config({ path: envPath });
 }
 
-const ALLOWED_COMMANDS = {
-  "board-list": ["jira", "board", "list"],
-  "ticket-list": ["jira", "workitem", "search"],
-  "ticket-show": ["jira", "workitem", "view"],
-  "comment-list": ["jira", "workitem", "comment", "list"],
-  "comment-add": ["jira", "workitem", "comment", "create"],
-  "comment-delete": ["jira", "workitem", "comment", "delete"],
-  transition: ["jira", "workitem", "transition"]
+const COMMANDS = {
+  "board-list": {
+    acli: ["jira", "board", "search"],
+    write: false,
+    supportsJson: true,
+    supportsAcliYes: false,
+    flags: {
+      project: "--project",
+      name: "--name",
+      type: "--type",
+      limit: "--limit",
+      "order-by": "--order-by"
+    }
+  },
+  "ticket-list": {
+    acli: ["jira", "workitem", "search"],
+    write: false,
+    supportsJson: true,
+    supportsAcliYes: false,
+    flags: {
+      jql: "--jql",
+      limit: "--limit",
+      fields: "--fields"
+    },
+    synthesize(args) {
+      if (!args.jql) {
+        const project = args.project || process.env.JIRA_DEFAULT_PROJECT;
+        if (!project) {
+          return "ticket-list requires --jql or --project or JIRA_DEFAULT_PROJECT";
+        }
+        args.jql = `project = ${project} ORDER BY updated DESC`;
+      }
+      return null;
+    }
+  },
+  "ticket-show": {
+    acli: ["jira", "workitem", "view"],
+    write: false,
+    supportsJson: true,
+    supportsAcliYes: false,
+    positional: ["key"],
+    required: ["key"],
+    flags: {
+      fields: "--fields"
+    }
+  },
+  "comment-list": {
+    acli: ["jira", "workitem", "comment", "list"],
+    write: false,
+    supportsJson: true,
+    supportsAcliYes: false,
+    required: ["key"],
+    flags: {
+      key: "--key",
+      limit: "--limit",
+      order: "--order"
+    }
+  },
+  "comment-add": {
+    acli: ["jira", "workitem", "comment", "create"],
+    write: true,
+    supportsJson: true,
+    supportsAcliYes: false,
+    required: ["key"],
+    flags: {
+      key: "--key",
+      body: "--body",
+      "body-file": "--body-file"
+    },
+    validate(args) {
+      const hasBody = Boolean(args.body);
+      const hasFile = Boolean(args["body-file"]);
+      if (!hasBody && !hasFile) return "comment-add requires --body or --body-file";
+      if (hasBody && hasFile) return "comment-add accepts only one of --body or --body-file";
+      return null;
+    }
+  },
+  "comment-delete": {
+    acli: ["jira", "workitem", "comment", "delete"],
+    write: true,
+    supportsJson: false,
+    supportsAcliYes: false,
+    required: ["key", "id"],
+    flags: {
+      key: "--key",
+      id: "--id"
+    }
+  },
+  transition: {
+    acli: ["jira", "workitem", "transition"],
+    write: true,
+    supportsJson: true,
+    supportsAcliYes: true,
+    required: ["key", "status"],
+    flags: {
+      key: "--key",
+      status: "--status"
+    }
+  }
 };
 
 function printHelp() {
@@ -29,9 +120,9 @@ function printHelp() {
       "local-jira-cli <command> [options]",
       "local-jira-cli ticket-list --jql \"project = TEAM ORDER BY created DESC\" --limit 20"
     ],
-    commands: Object.keys(ALLOWED_COMMANDS),
+    commands: Object.keys(COMMANDS),
     commonOptions: [
-      "--json (always forced to true)",
+      "--json (forced when the underlying acli command supports it)",
       "--dry-run (print resolved ACLI command only)",
       "--yes (required for write commands unless --dry-run)",
       "--project <KEY> (used with ticket-list when JQL is omitted)"
@@ -70,85 +161,49 @@ function parseArgs(argv) {
   return out;
 }
 
-function isWriteCommand(cmd) {
-  return cmd === "comment-add" || cmd === "comment-delete" || cmd === "transition";
-}
-
 function resolveAcliBinary() {
   return process.env.ACLI_PATH || "acli";
 }
 
-function buildAcliArgs(command, args) {
-  const base = [...ALLOWED_COMMANDS[command]];
-  const pushIf = (flag, key) => {
-    if (args[key] !== undefined && args[key] !== true) {
-      base.push(flag, String(args[key]));
-    }
-  };
-
-  if (command === "ticket-list") {
-    if (!args.jql) {
-      const project = args.project || process.env.JIRA_DEFAULT_PROJECT;
-      if (!project) {
-        fail("VALIDATION_ERROR", "ticket-list requires --jql or --project or JIRA_DEFAULT_PROJECT");
-      }
-      args.jql = `project = ${project} ORDER BY updated DESC`;
-    }
-    pushIf("--jql", "jql");
-    pushIf("--limit", "limit");
+function buildAcliArgs(name, spec, args) {
+  if (typeof spec.synthesize === "function") {
+    const err = spec.synthesize(args);
+    if (err) fail("VALIDATION_ERROR", err);
   }
 
-  if (command === "ticket-show") {
-    pushIf("--key", "key");
-  }
-
-  if (command === "comment-list") {
-    pushIf("--key", "key");
-    pushIf("--limit", "limit");
-    pushIf("--order", "order");
-  }
-
-  if (command === "comment-add") {
-    pushIf("--key", "key");
-    pushIf("--body", "body");
-    pushIf("--body-file", "body-file");
-  }
-
-  if (command === "comment-delete") {
-    pushIf("--key", "key");
-    pushIf("--id", "id");
-  }
-
-  if (command === "transition") {
-    pushIf("--key", "key");
-    pushIf("--status", "status");
-  }
-
-  if (command !== "board-list") {
-    if (!base.includes("--key") && ["ticket-show", "comment-list", "comment-add", "comment-delete", "transition"].includes(command)) {
-      if (!args.key) fail("VALIDATION_ERROR", `${command} requires --key`);
+  for (const req of spec.required || []) {
+    if (args[req] === undefined || args[req] === true) {
+      fail("VALIDATION_ERROR", `${name} requires --${req}`);
     }
   }
 
-  if (command === "comment-add" && !args.body && !args["body-file"]) {
-    fail("VALIDATION_ERROR", "comment-add requires --body or --body-file");
-  }
-  if (command === "comment-delete" && !args.id) {
-    fail("VALIDATION_ERROR", "comment-delete requires --id");
-  }
-  if (command === "transition" && !args.status) {
-    fail("VALIDATION_ERROR", "transition requires --status");
+  if (typeof spec.validate === "function") {
+    const err = spec.validate(args);
+    if (err) fail("VALIDATION_ERROR", err);
   }
 
-  if (isWriteCommand(command)) {
-    if (!args.yes && !args["dry-run"]) {
-      fail("CONFIRMATION_REQUIRED", "Write command requires --yes (or use --dry-run)");
-    }
-    base.push("--yes");
+  if (spec.write && !args.yes && !args["dry-run"]) {
+    fail("CONFIRMATION_REQUIRED", `${name} is a write command — pass --yes (or use --dry-run)`);
   }
 
-  base.push("--json");
-  return base;
+  const out = [...spec.acli];
+
+  for (const key of spec.positional || []) {
+    out.push(String(args[key]));
+  }
+
+  const positionalSet = new Set(spec.positional || []);
+  for (const [argKey, flag] of Object.entries(spec.flags || {})) {
+    if (positionalSet.has(argKey)) continue;
+    const v = args[argKey];
+    if (v === undefined || v === true) continue;
+    out.push(flag, String(v));
+  }
+
+  if (spec.supportsAcliYes) out.push("--yes");
+  if (spec.supportsJson) out.push("--json");
+
+  return out;
 }
 
 function main() {
@@ -160,12 +215,13 @@ function main() {
     return;
   }
 
-  if (!ALLOWED_COMMANDS[command]) {
-    fail("UNKNOWN_COMMAND", `Unsupported command: ${command}`, { allowed: Object.keys(ALLOWED_COMMANDS) });
+  const spec = COMMANDS[command];
+  if (!spec) {
+    fail("UNKNOWN_COMMAND", `Unsupported command: ${command}`, { allowed: Object.keys(COMMANDS) });
   }
 
   const acli = resolveAcliBinary();
-  const acliArgs = buildAcliArgs(command, args);
+  const acliArgs = buildAcliArgs(command, spec, args);
 
   if (args["dry-run"]) {
     process.stdout.write(`${JSON.stringify({ ok: true, dryRun: true, cmd: [acli, ...acliArgs] }, null, 2)}\n`);
@@ -187,6 +243,12 @@ function main() {
   }
 
   const stdout = (result.stdout || "").trim();
+
+  if (!spec.supportsJson) {
+    process.stdout.write(`${JSON.stringify({ ok: true, result: { stdout } }, null, 2)}\n`);
+    return;
+  }
+
   if (!stdout) {
     process.stdout.write(`${JSON.stringify({ ok: true, result: null }, null, 2)}\n`);
     return;
