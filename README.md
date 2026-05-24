@@ -86,9 +86,9 @@ cp .env.example .env
 
 - `ACLI_PATH` (선택): 기본 `acli`. PATH 외 위치라면 절대 경로를 지정
 - `JIRA_DEFAULT_PROJECT` (선택): `ticket-list`에서 `--jql` 생략 시 사용
-- `JIRA_SITE` 또는 `JIRA_BASE_URL` (선택): `transition-list` REST 조회에 사용
-- `JIRA_EMAIL` (선택): `transition-list` REST 조회에 사용
-- `JIRA_API_TOKEN_FILE` 또는 `JIRA_API_TOKEN` (선택): `transition-list` REST 조회에 사용. 파일 방식 권장
+- `JIRA_SITE` 또는 `JIRA_BASE_URL` (선택): `transition-list`, 스프린트 이동 REST 호출에 사용
+- `JIRA_EMAIL` (선택): `transition-list`, 스프린트 이동 REST 호출에 사용
+- `JIRA_API_TOKEN_FILE` 또는 `JIRA_API_TOKEN` (선택): `transition-list`, 스프린트 이동 REST 호출에 사용. 파일 방식 권장
 
 ## 5. 사용법
 
@@ -107,10 +107,14 @@ node local-jira-cli.js --help
 | `ticket-context` | `workitem view` + `comment list` | 조회 조합 |
 | `ticket-tree` | `workitem view` + `workitem search parent = ...` | 조회 조합 |
 | `transition-list` | Jira REST `/transitions` | 조회 |
+| `sprint-list` | `jira board list-sprints` | 조회 |
+| `sprint-resolve` | `board search` + `board list-sprints` | 조회 조합 |
+| `ticket-sprint-move` | Jira REST sprint/backlog issue move | 쓰기 (`--yes` 필수) |
 | `comment-add` | `jira workitem comment create` | 쓰기 (`--yes` 필수) |
 | `comment-delete` | `jira workitem comment delete` | 쓰기 (`--yes` 필수) |
 | `transition` | `jira workitem transition` | 쓰기 (`--yes` 필수) |
 | `project-overview` | `board search` + `workitem search` + `board list-sprints` | 조회 조합 |
+| `ticket-create` | `jira workitem create` + 선택적 sprint/backlog move | 쓰기 (`--yes` 필수) |
 | `ticket-update` | `jira workitem edit` | 쓰기 (`--yes` 필수) |
 
 쓰기 명령은 `--yes` 또는 `--dry-run` 없으면 래퍼 차원에서 `CONFIRMATION_REQUIRED`로 차단됩니다.
@@ -142,6 +146,18 @@ node local-jira-cli.js ticket-tree --key TEAM-123 --depth 2 --limit 50
 # 프로젝트 오버뷰 (보드 + 활성/예정 스프린트 + 최근 티켓)
 node local-jira-cli.js project-overview --project TEAM --limit 20 --board-limit 5
 
+# 스프린트 목록
+node local-jira-cli.js sprint-list --project TEAM --board-name "SP 보드" --state active,future
+
+# 스프린트 alias 해석: current/this-week/이번주, next/next-week/다음주, backlog/none, id:<ID>, name:<NAME>
+node local-jira-cli.js sprint-resolve --project TEAM --target current
+
+# 티켓을 현재 스프린트로 이동
+node local-jira-cli.js ticket-sprint-move --key TEAM-123 --project TEAM --target current --yes
+
+# 티켓을 backlog로 이동
+node local-jira-cli.js ticket-sprint-move --key TEAM-123 --target backlog --yes
+
 # 가능한 상태 전이 후보 조회 (JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN_FILE 필요)
 node local-jira-cli.js transition-list --key TEAM-123
 
@@ -156,6 +172,9 @@ node local-jira-cli.js comment-delete --key TEAM-123 --id 79216 --yes
 
 # 상태 전이
 node local-jira-cli.js transition --key TEAM-123 --status "진행 중" --yes
+
+# 티켓 생성 후 현재 스프린트에 배치
+node local-jira-cli.js ticket-create --project TEAM --type 작업 --summary "작업 제목" --parent TEAM-1 --sprint current --yes
 
 # 티켓 수정 (본문은 파일 기반 권장)
 node local-jira-cli.js ticket-update --key TEAM-123 --description-file ./description.md --yes

@@ -114,6 +114,26 @@ const COMMANDS = {
     write: false,
     required: ["key"]
   },
+  "sprint-list": {
+    handler: runSprintList,
+    write: false,
+    synthesize: synthesizeProjectOrBoard
+  },
+  "sprint-resolve": {
+    handler: runSprintResolve,
+    write: false,
+    required: ["target"],
+    synthesize: synthesizeProjectOrBoard
+  },
+  "ticket-sprint-move": {
+    handler: runTicketSprintMove,
+    write: true,
+    required: ["key", "target"],
+    synthesize(args) {
+      if (isBacklogTarget(args.target)) return null;
+      return synthesizeProjectOrBoard(args);
+    }
+  },
   transition: {
     acli: ["jira", "workitem", "transition"],
     write: true,
@@ -128,11 +148,43 @@ const COMMANDS = {
   "project-overview": {
     handler: runProjectOverview,
     write: false,
+    synthesize: synthesizeProject
+  },
+  "ticket-create": {
+    handler: runTicketCreate,
+    write: true,
     synthesize(args) {
-      if (!args.project) {
+      if (!args.project && !args["from-json"]) {
         const project = process.env.JIRA_DEFAULT_PROJECT;
-        if (!project) return "project-overview requires --project or JIRA_DEFAULT_PROJECT";
+        if (!project) return "ticket-create requires --project or JIRA_DEFAULT_PROJECT unless --from-json is used";
         args.project = project;
+      }
+      if (args.sprint && !isBacklogTarget(args.sprint)) {
+        return synthesizeProject(args);
+      }
+      return null;
+    },
+    validate(args) {
+      if (args["from-json"]) return null;
+      if (!args.summary && !args["from-file"]) return "ticket-create requires --summary, --from-file, or --from-json";
+      if (!args.type) return "ticket-create requires --type unless --from-json is used";
+      if (args["description-file"] !== undefined) {
+        if (args["description-file"] === true) return "ticket-create requires a file path for --description-file";
+        const descriptionPath = path.resolve(process.cwd(), expandHome(String(args["description-file"])));
+        if (!fs.existsSync(descriptionPath)) return `description file does not exist: ${descriptionPath}`;
+        if (!fs.statSync(descriptionPath).isFile()) return `description path is not a file: ${descriptionPath}`;
+      }
+      if (args["from-file"] !== undefined) {
+        if (args["from-file"] === true) return "ticket-create requires a file path for --from-file";
+        const fromFilePath = path.resolve(process.cwd(), expandHome(String(args["from-file"])));
+        if (!fs.existsSync(fromFilePath)) return `from-file does not exist: ${fromFilePath}`;
+        if (!fs.statSync(fromFilePath).isFile()) return `from-file path is not a file: ${fromFilePath}`;
+      }
+      if (args["from-json"] !== undefined) {
+        if (args["from-json"] === true) return "ticket-create requires a file path for --from-json";
+        const fromJsonPath = path.resolve(process.cwd(), expandHome(String(args["from-json"])));
+        if (!fs.existsSync(fromJsonPath)) return `from-json file does not exist: ${fromJsonPath}`;
+        if (!fs.statSync(fromJsonPath).isFile()) return `from-json path is not a file: ${fromJsonPath}`;
       }
       return null;
     }
@@ -221,6 +273,20 @@ function parseArgs(argv) {
 
 function resolveAcliBinary() {
   return process.env.ACLI_PATH || "acli";
+}
+
+function synthesizeProject(args) {
+  if (!args.project) {
+    const project = process.env.JIRA_DEFAULT_PROJECT;
+    if (!project) return "command requires --project or JIRA_DEFAULT_PROJECT";
+    args.project = project;
+  }
+  return null;
+}
+
+function synthesizeProjectOrBoard(args) {
+  if (args["board-id"] || args.board) return null;
+  return synthesizeProject(args);
 }
 
 function validateSpec(name, spec, args) {
@@ -460,6 +526,154 @@ function printDryRun(steps) {
   process.stdout.write(`${JSON.stringify({ ok: true, dryRun: true, steps }, null, 2)}\n`);
 }
 
+function parseList(value) {
+  if (value === undefined || value === true) return [];
+  return String(value).split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function isBacklogTarget(target) {
+  if (target === undefined || target === true) return false;
+  return ["backlog", "none", "no-sprint", "unsprinted", "백로그", "스프린트없음", "스프린트-없음"].includes(String(target).trim().toLowerCase());
+}
+
+function isCurrentSprintTarget(target) {
+  if (target === undefined || target === true) return false;
+  return ["current", "this-week", "this", "active", "이번주", "이번-주", "현재", "현재스프린트"].includes(String(target).trim().toLowerCase());
+}
+
+function isNextSprintTarget(target) {
+  if (target === undefined || target === true) return false;
+  return ["next", "next-week", "future", "다음주", "다음-주", "다음", "다음스프린트"].includes(String(target).trim().toLowerCase());
+}
+
+function sortSprintsByDate(sprints) {
+  return [...sprints].sort((a, b) => {
+    const aDate = Date.parse(a.startDate || a.endDate || "");
+    const bDate = Date.parse(b.startDate || b.endDate || "");
+    if (Number.isFinite(aDate) && Number.isFinite(bDate) && aDate !== bDate) return aDate - bDate;
+    if (Number.isFinite(aDate) && !Number.isFinite(bDate)) return -1;
+    if (!Number.isFinite(aDate) && Number.isFinite(bDate)) return 1;
+    return Number(a.id) - Number(b.id);
+  });
+}
+
+function normalizeSprint(sprint) {
+  return {
+    id: sprint.id || null,
+    name: sprint.name || null,
+    state: sprint.state || null,
+    startDate: sprint.startDate || null,
+    endDate: sprint.endDate || null,
+    goal: sprint.goal || "",
+    originBoardId: sprint.originBoardId || sprint.boardId || null
+  };
+}
+
+function boardSearch(acli, project, limit) {
+  return runAcliJson(acli, ["jira", "board", "search", "--project", project, "--limit", String(limit), "--json"]);
+}
+
+function sprintListForBoard(acli, boardId, state, limit) {
+  return runAcliJson(acli, [
+    "jira",
+    "board",
+    "list-sprints",
+    "--id",
+    String(boardId),
+    "--state",
+    state,
+    "--limit",
+    String(limit),
+    "--json"
+  ]);
+}
+
+function getSprintValues(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload.sprints)) return payload.sprints;
+  if (Array.isArray(payload.values)) return payload.values;
+  return [];
+}
+
+function resolveBoard(acli, args, options = {}) {
+  const boardId = args["board-id"] || args.board;
+  if (boardId && boardId !== true) {
+    return { id: Number(boardId), source: "argument" };
+  }
+
+  const project = args.project || process.env.JIRA_DEFAULT_PROJECT;
+  if (!project) {
+    fail("VALIDATION_ERROR", `${options.command || "command"} requires --board-id or --project or JIRA_DEFAULT_PROJECT`);
+  }
+
+  const boardLimit = asInt(args["board-limit"], options.boardLimit || 20);
+  const boardName = args["board-name"] && args["board-name"] !== true ? String(args["board-name"]) : null;
+  const payload = boardSearch(acli, project, boardLimit);
+  let boards = payload && Array.isArray(payload.values) ? payload.values : [];
+  boards = boards.filter((board) => board.type === "scrum");
+  if (boardName) {
+    boards = boards.filter((board) => board.name === boardName);
+  }
+
+  if (boards.length === 0) {
+    fail("NOT_FOUND", "No matching scrum board found", { project, boardName, boards: payload && payload.values || [] });
+  }
+
+  if (boards.length > 1) {
+    fail("AMBIGUOUS_BOARD", "Multiple scrum boards matched; pass --board-id or --board-name", {
+      project,
+      boards: boards.map((board) => ({ id: board.id, name: board.name, location: board.location, type: board.type }))
+    });
+  }
+
+  return { ...boards[0], source: "project" };
+}
+
+function resolveSprint(acli, args, target, options = {}) {
+  const value = String(target).trim();
+  if (isBacklogTarget(value)) return { kind: "backlog", target: value };
+
+  const board = resolveBoard(acli, args, options);
+  const limit = asInt(args["sprint-limit"], options.sprintLimit || 50);
+  const state = options.state || "active,future";
+  const payload = sprintListForBoard(acli, board.id, state, limit);
+  const sprints = getSprintValues(payload).map(normalizeSprint);
+
+  let matched = null;
+  const lower = value.toLowerCase();
+
+  if (isCurrentSprintTarget(value)) {
+    matched = sortSprintsByDate(sprints.filter((sprint) => sprint.state === "active"))[0] || null;
+  } else if (isNextSprintTarget(value)) {
+    matched = sortSprintsByDate(sprints.filter((sprint) => sprint.state === "future"))[0] || null;
+  } else if (/^id:\d+$/i.test(value)) {
+    const id = Number(value.slice(value.indexOf(":") + 1));
+    matched = sprints.find((sprint) => Number(sprint.id) === id) || null;
+  } else if (/^\d+$/.test(value)) {
+    const id = Number(value);
+    matched = sprints.find((sprint) => Number(sprint.id) === id) || null;
+  } else if (lower.startsWith("name:")) {
+    const name = value.slice(value.indexOf(":") + 1);
+    matched = sprints.find((sprint) => sprint.name === name) || null;
+  } else {
+    matched = sprints.find((sprint) => sprint.name === value) || null;
+  }
+
+  if (!matched) {
+    fail("NOT_FOUND", "No matching sprint found", {
+      target: value,
+      board: { id: board.id, name: board.name },
+      available: sprints.map((sprint) => ({ id: sprint.id, name: sprint.name, state: sprint.state, startDate: sprint.startDate, endDate: sprint.endDate }))
+    });
+  }
+
+  if (options.requireMovable && !["active", "future"].includes(matched.state)) {
+    fail("VALIDATION_ERROR", "Target sprint must be active or future", { target: value, sprint: matched });
+  }
+
+  return { kind: "sprint", target: value, board, sprint: matched, source: payload };
+}
+
 function runTicketContext(name, spec, args, acli) {
   validateSpec(name, spec, args);
   const key = String(args.key);
@@ -618,6 +832,184 @@ function runProjectOverview(name, spec, args, acli) {
   });
 }
 
+function runSprintList(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const state = args.state && args.state !== true ? String(args.state) : "active,future";
+  const limit = asInt(args.limit || args["sprint-limit"], 50);
+  if (args["dry-run"]) {
+    const boardId = args["board-id"] || args.board;
+    const steps = [];
+    if (!boardId) {
+      steps.push([acli, "jira", "board", "search", "--project", String(args.project), "--limit", String(asInt(args["board-limit"], 20)), "--json"]);
+    }
+    steps.push([acli, "jira", "board", "list-sprints", "--id", boardId ? String(boardId) : "<resolved-board-id>", "--state", state, "--limit", String(limit), "--json"]);
+    return printDryRun(steps);
+  }
+
+  const board = resolveBoard(acli, args, { command: name });
+
+  const payload = sprintListForBoard(acli, board.id, state, limit);
+  return printOk({
+    board: { id: board.id, name: board.name || null, location: board.location || null, type: board.type || null },
+    state,
+    sprints: getSprintValues(payload).map(normalizeSprint),
+    page: {
+      isLast: payload && payload.isLast,
+      startAt: payload && payload.startAt,
+      maxResults: payload && payload.maxResults,
+      total: payload && payload.total
+    }
+  });
+}
+
+function runSprintResolve(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const target = String(args.target);
+  if (isBacklogTarget(target)) {
+    return printOk({ target, kind: "backlog" });
+  }
+
+  if (args["dry-run"]) {
+    const boardId = args["board-id"] || args.board;
+    const steps = [];
+    if (!boardId) {
+      steps.push([acli, "jira", "board", "search", "--project", String(args.project), "--limit", String(asInt(args["board-limit"], 20)), "--json"]);
+    }
+    steps.push([acli, "jira", "board", "list-sprints", "--id", boardId ? String(boardId) : "<resolved-board-id>", "--state", "active,future", "--limit", String(asInt(args["sprint-limit"], 50)), "--json"]);
+    return printDryRun(steps);
+  }
+
+  const resolved = resolveSprint(acli, args, target, { command: name, requireMovable: false });
+  return printOk({
+    target,
+    kind: resolved.kind,
+    board: resolved.board ? { id: resolved.board.id, name: resolved.board.name || null, location: resolved.board.location || null } : null,
+    sprint: resolved.sprint || null
+  });
+}
+
+async function moveIssuesToSprintTarget(acli, args, keys, target) {
+  if (keys.length === 0) fail("VALIDATION_ERROR", "No issue keys provided");
+  if (keys.length > 50) fail("VALIDATION_ERROR", "At most 50 issues may be moved in one operation");
+
+  if (isBacklogTarget(target)) {
+    await jiraRestPost("/rest/agile/1.0/backlog/issue", args, { issues: keys });
+    return { target: "backlog", issues: keys };
+  }
+
+  const resolved = resolveSprint(acli, args, target, { command: "ticket-sprint-move", requireMovable: true });
+  await jiraRestPost(`/rest/agile/1.0/sprint/${encodeURIComponent(String(resolved.sprint.id))}/issue`, args, { issues: keys });
+  return {
+    target,
+    issues: keys,
+    board: { id: resolved.board.id, name: resolved.board.name || null },
+    sprint: resolved.sprint
+  };
+}
+
+function dryRunSprintMoveSteps(acli, args, keys, target) {
+  if (isBacklogTarget(target)) {
+    return [["POST", "/rest/agile/1.0/backlog/issue", { issues: keys }]];
+  }
+
+  const boardId = args["board-id"] || args.board;
+  const steps = [];
+  if (!boardId) {
+    steps.push([acli, "jira", "board", "search", "--project", String(args.project), "--limit", String(asInt(args["board-limit"], 20)), "--json"]);
+  }
+  steps.push(
+    [acli, "jira", "board", "list-sprints", "--id", boardId ? String(boardId) : "<resolved-board-id>", "--state", "active,future", "--limit", String(asInt(args["sprint-limit"], 50)), "--json"],
+    ["POST", "/rest/agile/1.0/sprint/<resolved-sprint-id>/issue", { issues: keys }]
+  );
+  return steps;
+}
+
+async function runTicketSprintMove(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const keys = parseList(args.key);
+  const target = String(args.target);
+
+  if (keys.length === 0) fail("VALIDATION_ERROR", "ticket-sprint-move requires --key");
+  if (keys.length > 50) fail("VALIDATION_ERROR", "At most 50 issues may be moved in one operation");
+
+  if (args["dry-run"]) return printDryRun(dryRunSprintMoveSteps(acli, args, keys, target));
+
+  try {
+    const moved = await moveIssuesToSprintTarget(acli, args, keys, target);
+    return printOk(moved);
+  } catch (e) {
+    fail("REST_ERROR", "Failed to move issue(s) to sprint target", { message: e.message });
+  }
+}
+
+function buildTicketCreateAcliArgs(args) {
+  const out = ["jira", "workitem", "create"];
+  const pushValue = (flag, key) => {
+    const value = args[key];
+    if (value === undefined || value === true) return;
+    out.push(flag, String(value));
+  };
+
+  pushValue("--project", "project");
+  pushValue("--type", "type");
+  pushValue("--summary", "summary");
+  pushValue("--description", "description");
+  pushValue("--description-file", "description-file");
+  pushValue("--from-file", "from-file");
+  pushValue("--from-json", "from-json");
+  pushValue("--assignee", "assignee");
+  pushValue("--parent", "parent");
+
+  if (args.label !== undefined && args.label !== true) out.push("--label", String(args.label));
+  if (args.labels !== undefined && args.labels !== true) out.push("--label", String(args.labels));
+
+  out.push("--json");
+  return out;
+}
+
+function extractCreatedIssueKey(payload) {
+  if (!payload) return null;
+  if (payload.key) return payload.key;
+  if (payload.issue && payload.issue.key) return payload.issue.key;
+  if (payload.result && payload.result.key) return payload.result.key;
+  if (Array.isArray(payload.issues) && payload.issues[0] && payload.issues[0].key) return payload.issues[0].key;
+  return null;
+}
+
+async function runTicketCreate(name, spec, args, acli) {
+  validateSpec(name, spec, args);
+  const createArgs = buildTicketCreateAcliArgs(args);
+
+  if (args["dry-run"]) {
+    const steps = [[acli, ...createArgs]];
+    if (args.sprint !== undefined && args.sprint !== true) {
+      steps.push(...dryRunSprintMoveSteps(acli, args, ["<created-issue-key>"], String(args.sprint)));
+    }
+    return printDryRun(steps);
+  }
+
+  const created = runAcliJson(acli, createArgs);
+  const key = extractCreatedIssueKey(created);
+  if (!key) {
+    return printOk({
+      created,
+      sprintMove: null,
+      warning: "created issue key could not be inferred; sprint move was skipped"
+    });
+  }
+
+  let sprintMove = null;
+  if (args.sprint !== undefined && args.sprint !== true) {
+    try {
+      sprintMove = await moveIssuesToSprintTarget(acli, args, [key], String(args.sprint));
+    } catch (e) {
+      fail("REST_ERROR", "Issue was created but sprint move failed", { key, message: e.message });
+    }
+  }
+
+  return printOk({ created, key, sprintMove });
+}
+
 function normalizeSite(site) {
   if (!site) return null;
   const value = String(site).trim();
@@ -645,23 +1037,25 @@ function readToken(args) {
   return fs.readFileSync(resolved, "utf8").trim();
 }
 
-function jiraRestGet(pathname, args) {
+function jiraRestRequest(method, pathname, args, bodyData) {
   const baseUrl = normalizeSite(args.site || process.env.JIRA_BASE_URL || process.env.JIRA_SITE);
   const email = args.email || process.env.JIRA_EMAIL;
   const token = readToken(args);
   if (!baseUrl || !email || !token) {
-    fail("CONFIG_REQUIRED", "transition-list requires JIRA_BASE_URL/JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN or JIRA_API_TOKEN_FILE for Jira REST access");
+    fail("CONFIG_REQUIRED", "Jira REST commands require JIRA_BASE_URL/JIRA_SITE, JIRA_EMAIL, and JIRA_API_TOKEN or JIRA_API_TOKEN_FILE");
   }
 
   const url = new URL(pathname, baseUrl);
   const auth = Buffer.from(`${email}:${token}`).toString("base64");
+  const body = bodyData === undefined ? null : JSON.stringify(bodyData);
 
   return new Promise((resolve, reject) => {
     const req = https.request(url, {
-      method: "GET",
+      method,
       headers: {
         Accept: "application/json",
-        Authorization: `Basic ${auth}`
+        Authorization: `Basic ${auth}`,
+        ...(body ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } : {})
       }
     }, (res) => {
       let body = "";
@@ -672,16 +1066,29 @@ function jiraRestGet(pathname, args) {
           reject(new Error(`Jira REST returned ${res.statusCode}: ${body.slice(0, 1000)}`));
           return;
         }
+        if (res.statusCode === 204 || !body.trim()) {
+          resolve(null);
+          return;
+        }
         try {
-          resolve(body ? JSON.parse(body) : null);
+          resolve(JSON.parse(body));
         } catch (e) {
           reject(new Error(`Jira REST output is not valid JSON: ${body.slice(0, 1000)}`));
         }
       });
     });
     req.on("error", reject);
+    if (body) req.write(body);
     req.end();
   });
+}
+
+function jiraRestGet(pathname, args) {
+  return jiraRestRequest("GET", pathname, args);
+}
+
+function jiraRestPost(pathname, args, bodyData) {
+  return jiraRestRequest("POST", pathname, args, bodyData);
 }
 
 async function runTransitionList(name, spec, args) {
