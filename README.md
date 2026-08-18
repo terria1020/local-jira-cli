@@ -45,12 +45,32 @@ ACLI는 일반적인 Jira work item, comment, board, sprint 조회/수정에 사
 
 ## 설치
 
-macOS Homebrew 기준:
+### macOS Homebrew
+
+Atlassian 공식 tap을 먼저 등록한 뒤 설치합니다.
 
 ```bash
-brew install atlassian/acli/acli
+brew tap atlassian/homebrew-acli
+brew install acli
 acli --version
 ```
+
+### macOS 직접 다운로드
+
+Homebrew를 사용하지 않는 경우 Atlassian 배포 바이너리를 내려받아 실행 권한을 부여합니다.
+
+```bash
+# Apple Silicon
+curl -LO "https://acli.atlassian.com/darwin/latest/acli_darwin_arm64/acli"
+
+# Intel Mac은 위 명령 대신 다음 URL 사용
+# curl -LO "https://acli.atlassian.com/darwin/latest/acli_darwin_amd64/acli"
+
+chmod +x ./acli
+./acli --version
+```
+
+전역 실행이 필요하면 `acli` 바이너리를 PATH에 포함된 위치로 옮기거나, 해당 절대 경로를 `.env`의 `ACLI_PATH`에 설정합니다.
 
 프로젝트 의존성 설치:
 
